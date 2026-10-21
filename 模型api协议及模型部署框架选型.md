@@ -62,7 +62,100 @@ DSH 的 **Settings → Models** 中：
 
 图例：✅ 官方文档确认提供；❌ 官方未提供（不代表第三方桥接不可用）。
 
-### 4.1 只支持 OpenAI 协议的框架，如何对接 Anthropic 客户端
+### 4.1 vLLM 三种协议的部署命令
+
+一条 `vllm serve` 命令即可同时暴露三种协议的路由（默认端口 8000，无需为每种协议单独启动）：
+
+```sh
+# 安装（需对应 CUDA 环境）
+pip install vllm
+
+# 启动：Chat Completions、Responses、Anthropic Messages 同时可用
+vllm serve Qwen/Qwen3-8B \
+  --host 0.0.0.0 --port 8000 \
+  --served-model-name qwen3-8b \
+  --api-key sk-local \
+  --enable-auto-tool-choice --tool-call-parser qwen3 \
+  --reasoning-parser qwen3
+```
+
+说明：
+
+- `--host 0.0.0.0` 是 **vLLM 自己的监听参数**，允许通配符（与 DSH 拒绝通配符是两回事）；只想本机访问就用 `--host 127.0.0.1`。
+- `--served-model-name` 固定对外的模型 ID（请求 `model` 字段用它），`--api-key` 要求请求带 `Authorization: Bearer sk-local`。
+- **工具调用**需要 `--enable-auto-tool-choice --tool-call-parser <解析器>`，**思考内容**需要 `--reasoning-parser <解析器>`；解析器按模型选择（如 `qwen3`、`glm4`、`deepseek_v3`），DSH 作为 agent 使用时这两项必备。
+- Docker 等价启动：
+
+  ```sh
+  docker run --gpus all -p 8000:8000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    vllm/vllm-openai:latest \
+    --model Qwen/Qwen3-8B --served-model-name qwen3-8b --api-key sk-local \
+    --enable-auto-tool-choice --tool-call-parser qwen3 --reasoning-parser qwen3
+  ```
+
+启动后逐条验证三种协议（都通了再往 DSH 里配）：
+
+```sh
+# 1) OpenAI Chat Completions → DSH 选 openai-completions
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"hi"}]}'
+
+# 2) OpenAI Responses → DSH 选 openai-responses
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer sk-local" -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-8b","input":"hi"}'
+
+# 3) Anthropic Messages → DSH 选 anthropic-messages
+curl http://127.0.0.1:8000/v1/messages \
+  -H "x-api-key: sk-local" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-8b","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+DSH 中对应填写（同一 vLLM 可建三个提供商，Provider ID 各不相同）：
+
+| 验证通过的端点 | DSH「API 协议」 | Base URL 示例 |
+|---|---|---|
+| `/v1/chat/completions` | `openai-completions` | `http://192.168.0.213:8000/v1` |
+| `/v1/responses` | `openai-responses` | `http://192.168.0.213:8000/v1` |
+| `/v1/messages` | `anthropic-messages` | 以 curl 实测能通的地址为准（Anthropic SDK 惯例为服务器根 `http://192.168.0.213:8000`） |
+
+版本注意——三种协议的最低 vLLM 版本：
+
+| 协议 | 最低版本 | 说明 |
+|---|---|---|
+| `/v1/chat/completions` | 所有版本 | vLLM 的基础能力 |
+| `/v1/responses` | **v0.10.0**（2025-07） | v0.10.x 需加 `--enable-responses-api` 才注册路由；之后版本默认注册 |
+| `/v1/messages` | **v0.11.1**（2025-11-18） | Anthropic 路由 PR #22627/#27882 于 2025-11-04 确认合入后的首个发布；v0.11.2 / v0.12.0 起必然包含 |
+
+判定与升级：
+
+```sh
+vllm --version                 # < v0.11.1 则 /v1/messages 一定没有
+vllm serve --help=responses    # 有 --enable-responses-api 说明 /v1/responses 需显式开启
+```
+
+- **最权威的判定是启动日志的 `Available routes` 列表**：出现 `/v1/messages`、`/v1/responses` 才算三协议齐备；路由缺失时先查版本/开关，再考虑升级（`pip install -U vllm`，升级前确认 CUDA/驱动兼容）。
+- 版本不满足期间，可先用已就绪的 `/v1/chat/completions` 在 DSH 配 `openai-completions` 正常使用，升级后再补建另外两个提供商。
+- 新版另有可调参数 `--anthropic-disabled-thinking-effort`（仅作用于 `/v1/messages` 的 `thinking: disabled` 请求）。
+- 各路由的支持细节（工具调用、思考、多模态）依模型与版本而定，以实际 curl 结果为准。
+
+环境栈匹配与升级约束（以 CUDA 12.4 + torch 2.7.0 + Python 3.12 这类旧栈为例）：
+
+- **旧栈通常对应旧版 vLLM**：CUDA 12.4 + torch 2.7.0 是 vLLM v0.8.x–v0.9.x 时代的默认组合，此时 `/v1/responses`、`/v1/messages` 都不存在——这正是启动日志路由缺失的根本原因，加开关无济于事，只能升级 vLLM。
+- **升级时 torch 与 CUDA 变体由 vLLM wheel 接管**：pip wheel 自带匹配的 torch 与 CUDA 运行库，本机旧 torch（如 2.7.0）和 CUDA toolkit（如 12.4）不构成障碍；**不要**手动 pin 旧 torch，建议新建干净的 conda/venv 环境安装。
+- **真正的硬约束是 NVIDIA 驱动**（`nvidia-smi` 查驱动版本与上限 CUDA 版本）：
+
+  | 目标 vLLM | CUDA 变体 | 驱动要求（Linux） |
+  |---|---|---|
+  | ≥ v0.11.1（`/v1/messages` 最低要求） | cu126 | ≥ 560.28 |
+  | | cu128（该版本默认） | ≥ 570 |
+  | 更高版本（默认 cu129 及以后） | cu129+ | 12.x 小版本兼容一般可用，以实际启动为准 |
+
+- 升级后重新验证启动日志 `Available routes`，三协议齐备后再在 DSH 补建提供商。驱动无法升级时，停在旧版并用 `openai-completions` 是唯一稳妥方案。
+
+### 4.2 只支持 OpenAI 协议的框架，如何对接 Anthropic 客户端
 
 - **协议转换 sidecar**：如 `siliconflow/anthropic-adapter`，把 `/v1/messages` 翻译为后端的 `/v1/chat/completions`，任何 OpenAI 兼容后端（vLLM、SGLang、TGI 等）都能对外提供 Anthropic 协议，覆盖流式、工具调用与思考映射。
 - **网关层转换**：LiteLLM 等聚合网关可在统一入口对外暴露多种协议，详见其官方文档。
